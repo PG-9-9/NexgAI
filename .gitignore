@@ -1,0 +1,7 @@
+med_bot
+*.egg-info
+*.env
+llm_bot
+llm_bot_docker
+llm_bot_aws_2
+Medical_book_modern.pdf

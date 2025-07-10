@@ -1,0 +1,11 @@
+sentence-transformers==2.4.0
+langchain
+flask
+pypdf
+python-dotenv
+pinecone-client[grpc]>=3.0.0  # Updated to latest, explicit version
+langchain-pinecone>=0.1.0     # Ensure compatibility with Pinecone
+langchain_community
+langchain_openai
+langchain_experimental
+-e .
