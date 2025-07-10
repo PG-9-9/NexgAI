@@ -1,0 +1,3 @@
+Activate env:
+
+conda activate env\nex
