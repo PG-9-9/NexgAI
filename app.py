@@ -1,92 +1,149 @@
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+# app.py
 
-from flask import Flask, render_template, jsonify, request
-from src.helper import download_hugging_face_embeddings
-from langchain_pinecone import PineconeVectorStore
-from langchain_openai import OpenAI
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.memory import ConversationBufferMemory
 from dotenv import load_dotenv
-from src.prompt import *
-import os
-
-app = Flask(__name__)
-
-# Load environment variables from .env file (for local development)
 load_dotenv()
 
-# Fetch environment variables with validation
-PINECONE_API_KEY = os.environ.get('PINECONE_API_KEY')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+import os
+import logging
+import torch
 
-if not PINECONE_API_KEY or not OPENAI_API_KEY:
-    raise ValueError("Missing required environment variables: PINECONE_API_KEY and/or OPENAI_API_KEY")
+from flask import Flask, render_template, request
+from pinecone import Pinecone
+from pinecone.exceptions import PineconeException
+from langgraph.graph import StateGraph
+from langchain_huggingface import HuggingFaceEmbeddings
+from openai import OpenAI
 
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+from src.prompt import system_prompt
+from langchain.memory import ConversationBufferMemory
 
-# Initialize embeddings
-embeddings = download_hugging_face_embeddings()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# Pinecone index setup
-index_name = "medicalbot"
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
+# load and validate keys
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+if not (PINECONE_API_KEY and OPENAI_API_KEY):
+    raise RuntimeError("Missing PINECONE_API_KEY or OPENAI_API_KEY in .env")
+
+# initialize OpenAI client for v1.0.0+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# detect GPU vs CPU
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device for embeddings: {device}")
+
+# initialize Pinecone
+pc = Pinecone(
+    api_key=PINECONE_API_KEY,
+    environment=os.getenv("PINECONE_ENVIRONMENT", "us-east1-gcp")
 )
-retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+INDEX_NAME = "medicalbot"
+if INDEX_NAME not in pc.list_indexes().names():
+    raise RuntimeError(f"Pinecone index '{INDEX_NAME}' not found – run store_index.py first")
 
-# Initialize LLM
-llm = OpenAI(temperature=0.4, max_tokens=500)
+# in-memory conversation
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# Initialize memory to store conversation history
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True
+# embedder matching your stored vectors
+embedder = HuggingFaceEmbeddings(
+    model_name="bionlp/bluebert_pubmed_uncased_L-12_H-768_A-12",
+    model_kwargs={"device": device},
+    encode_kwargs={"normalize_embeddings": True},
 )
 
-# Update prompt to include chat history
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="chat_history"),  # Add history here
-        ("human", "{input}"),
-    ]
-)
+# state schema
+from typing import TypedDict, List, Dict, Any
 
-# Create RAG chain with memory
-question_answer_chain = create_stuff_documents_chain(llm, prompt)
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+class ChatState(TypedDict):
+    query: str
+    index_name: str
+    namespace: str
+    chat_history: List[Dict[str, Any]]
+    docs: List[Dict[str, Any]]
+    response: str
+
+# LangGraph node: retrieve from Pinecone
+def pinecone_tool(state: ChatState) -> dict:
+    q_vec = embedder.embed_query(state["query"])
+    idx = pc.Index(state["index_name"])
+    resp = idx.query(
+        vector=q_vec,
+        top_k=3,
+        include_metadata=True,
+        namespace=state["namespace"]
+    )
+    docs = []
+    for match in resp["matches"]:
+        docs.append({"id": match["id"], "text": match["metadata"].get("text", "")})
+    return {"docs": docs}
+
+# LangGraph node: call the new OpenAI client
+def refine_response(state: ChatState) -> dict:
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in state["chat_history"]:
+        role = "user" if m["role"] == "human" else "assistant"
+        messages.append({"role": role, "content": m["content"]})
+    if state["docs"]:
+        snippet = "\n\n".join(d["text"] for d in state["docs"])
+        messages.append({
+            "role": "system",
+            "content": f"Relevant excerpts:\n{snippet}"
+        })
+    messages.append({"role": "user", "content": state["query"]})
+
+    resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        temperature=0.4,
+        max_tokens=500
+    )
+    # choices is a list of ChatCompletionChoice objects
+    answer = resp.choices[0].message.content.strip()
+    return {"response": answer}
+
+# assemble the graph
+graph = StateGraph(ChatState)
+graph.add_node("pinecone", pinecone_tool)
+graph.add_node("refine", refine_response)
+graph.add_edge("pinecone", "refine")
+graph.set_entry_point("pinecone")
+graph.set_finish_point("refine")
+compiled = graph.compile()
+
+# Flask app
+app = Flask(__name__)
 
 @app.route("/")
 def index():
-    # Clear memory on page load (optional, remove if you want persistent history across sessions)
     memory.clear()
-    return render_template('chat.html')
+    return render_template("chat.html")
 
-@app.route("/get", methods=["GET", "POST"])
+@app.route("/get", methods=["POST"])
 def chat():
-    msg = request.form["msg"]
-    print(f"Input: {msg}")
+    user_msg = request.form["msg"]
+    logger.info("User: %s", user_msg)
 
-    # Load existing chat history
-    chat_history = memory.load_memory_variables({})["chat_history"]
+    hist = memory.load_memory_variables({})["chat_history"]
+    history_formatted = [
+        {"role": m.type == "human" and "human" or "assistant", "content": m.content}
+        for m in hist
+    ]
 
-    # Invoke the chain with input and history
-    response = rag_chain.invoke({
-        "input": msg,
-        "chat_history": chat_history
-    })
-    answer = response["answer"]
-    print(f"Response: {answer}")
+    state: ChatState = {
+        "query": user_msg,
+        "index_name": INDEX_NAME,
+        "namespace": "",
+        "chat_history": history_formatted,
+        "docs": [],
+        "response": ""
+    }
+    final = compiled.invoke(state)
+    answer = final["response"]
+    logger.info("Bot: %s", answer)
 
-    # Save the new message and response to memory
-    memory.save_context({"input": msg}, {"output": answer})
+    memory.save_context({"input": user_msg}, {"output": answer})
+    return answer
 
-    return str(answer)
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8080, debug=True)#Works out
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=True)

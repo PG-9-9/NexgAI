@@ -1,3 +1,13 @@
 Activate env:
 
 conda activate env\nex
+
+Kill the port in Powershell(admin), if its already in use
+netstat -aon | findstr :8080
+taskkill /PID <pid> /F
+
+Running store_index:
+python store_index.py --data_percent 0.1  
+
+Question:
+Does Cirrhosis of liver occurs with primary peritonitis
