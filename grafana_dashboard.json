@@ -1,0 +1,35 @@
+{
+  "title": "MedBot Metrics",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Requests/sec",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(requests_total[1m])"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Latency p50",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(request_latency_seconds_bucket[5m])) by (le))"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Branch counts",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(branch) by (step)"
+        }
+      ]
+    }
+  ]
+}

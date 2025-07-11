@@ -5,14 +5,16 @@ load_dotenv()
 
 import os
 import time
+import json
 import logging
 import torch
 
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from pinecone import Pinecone
 from langgraph.graph import StateGraph
@@ -24,7 +26,6 @@ from langchain_openai.chat_models import ChatOpenAI
 
 from tenacity import retry, wait_exponential, stop_after_attempt
 from cachetools import TTLCache
-
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from src.prompt import system_prompt
@@ -39,9 +40,9 @@ BRANCH_COUNT = Counter("branch", "Branches taken", ["step"])
 
 # Config & keys
 INDEX_NAME = os.getenv("PINECONE_INDEX", "medicalbot")
-SIM_THRESH  = float(os.getenv("SIM_THRESH", "0.65"))
-CACHE_TTL   = int(os.getenv("CACHE_TTL", "600"))
-RATE_LIMIT  = int(os.getenv("RATE_LIMIT", "30"))
+SIM_THRESH = float(os.getenv("SIM_THRESH", "0.65"))
+CACHE_TTL  = int(os.getenv("CACHE_TTL", "600"))
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))
 
 pc_key   = os.getenv("PINECONE_API_KEY")
 open_key = os.getenv("OPENAI_API_KEY")
@@ -87,7 +88,7 @@ def pinecone_query(vec, top_k):
 def cohere_rerank(query, docs):
     return co.rerank(query=query, documents=docs, top_n=3, model="rerank-english-v3.0")
 
-# LangGraph state
+# Graph state
 from typing import TypedDict, List, Dict, Any
 class ChatState(TypedDict):
     query: str
@@ -97,12 +98,12 @@ class ChatState(TypedDict):
     docs: List[Dict[str, Any]]
     response: str
 
-# Graph nodes
+# Sync nodes
 def retrieve(state: ChatState) -> dict:
     BRANCH_COUNT.labels(step="retrieve").inc()
-    vec = embedder.embed_query(state["query"])
+    vec  = embedder.embed_query(state["query"])
     resp = pinecone_query(vec, 5)
-    docs = [{"id": m["id"], "text": m["metadata"]["text"], "score": m["score"]} for m in resp["matches"]]
+    docs = [{"id":m["id"], "text":m["metadata"]["text"], "score":m["score"]} for m in resp["matches"]]
     return {"docs": docs}
 
 def hyde(state: ChatState) -> dict:
@@ -113,13 +114,14 @@ def hyde(state: ChatState) -> dict:
     prompt = f"Draft a plausible answer to: {state['query']}"
     hypo = openai.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role":"user", "content":prompt}],
         temperature=0.0
     )
     text = hypo.choices[0].message.content
-    vec = embedder.embed_query(text)
+    vec  = embedder.embed_query(text)
     resp = pinecone_query(vec, 5)
-    return {"docs": [{"id": m["id"], "text": m["metadata"]["text"], "score": m["score"]} for m in resp["matches"]]}
+    docs2= [{"id":m["id"], "text":m["metadata"]["text"], "score":m["score"]} for m in resp["matches"]]
+    return {"docs": docs2}
 
 def rerank(state: ChatState) -> dict:
     BRANCH_COUNT.labels(step="rerank").inc()
@@ -127,7 +129,7 @@ def rerank(state: ChatState) -> dict:
     if not docs or co is None:
         return {"docs": docs}
     texts = [d["text"] for d in docs]
-    rr = cohere_rerank(state["query"], texts)
+    rr    = cohere_rerank(state["query"], texts)
     ranked = []
     if hasattr(rr, "results"):
         for r in rr.results:
@@ -146,23 +148,21 @@ def refine(state: ChatState) -> dict:
     messages = [{"role":"system","content":system_prompt}]
     for m in state["chat_history"]:
         role = "user" if m["role"]=="human" else "assistant"
-        messages.append({"role": role, "content": m["content"]})
+        messages.append({"role":role, "content":m["content"]})
     if state["docs"]:
         snippet = "\n\n".join(d["text"] for d in state["docs"])
         messages.append({"role":"system","content":f"Relevant excerpts:\n{snippet}"})
     messages.append({"role":"user","content":state["query"]})
 
-    # synchronous ChatCompletion
     resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
         temperature=0.4,
         max_tokens=500
     )
-    answer = resp.choices[0].message.content.strip()
-    return {"response": answer}
+    return {"response": resp.choices[0].message.content.strip()}
 
-# Assemble graph
+# Build graph
 graph = StateGraph(ChatState)
 graph.add_node("retrieve", retrieve)
 graph.add_node("hyde", hyde)
@@ -171,10 +171,10 @@ graph.add_node("refine", refine)
 graph.add_conditional_edges(
     "retrieve",
     lambda s: "hyde" if not s["docs"] or s["docs"][0]["score"] < SIM_THRESH else "rerank",
-    {"hyde": "hyde", "rerank": "rerank"}
+    {"hyde":"hyde","rerank":"rerank"}
 )
-graph.add_edge("hyde", "rerank")
-graph.add_edge("rerank", "refine")
+graph.add_edge("hyde","rerank")
+graph.add_edge("rerank","refine")
 graph.set_entry_point("retrieve")
 graph.set_finish_point("refine")
 compiled = graph.compile()
@@ -185,28 +185,40 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+# Serve Grafana dashboard JSON
+@app.on_event("startup")
+def write_dashboard():
+    with open("grafana_dashboard.json","w") as f:
+        json.dump({
+            "title":"MedBot Metrics",
+            "panels":[
+                {"type":"graph","title":"Requests/sec","datasource":"Prometheus","targets":[{"expr":"rate(requests_total[1m])"}]},
+                {"type":"graph","title":"Latency p50","datasource":"Prometheus","targets":[{"expr":"histogram_quantile(0.5, sum(rate(request_latency_seconds_bucket[5m])) by (le))"}]},
+                {"type":"graph","title":"Branch counts","datasource":"Prometheus","targets":[{"expr":"sum(branch) by (step)"}]}
+            ]
+        }, f, indent=2)
+
 @app.get("/metrics")
 def metrics():
     return HTMLResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": time.time()}
+    return {"status":"ok","time":time.time()}
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    logger.info("Rendering chat UI")
     memory.clear()
     return templates.TemplateResponse("chat.html", {"request": request})
 
 def check_rate(ip: str) -> bool:
     now = int(time.time())
-    window = rate_windows.setdefault(ip, [])
-    window = [t for t in window if t > now - 60]
-    if len(window) >= RATE_LIMIT:
+    win = rate_windows.setdefault(ip, [])
+    win = [t for t in win if t > now - 60]
+    if len(win) >= RATE_LIMIT:
         return False
-    window.append(now)
-    rate_windows[ip] = window
+    win.append(now)
+    rate_windows[ip] = win
     return True
 
 @app.post("/get")
@@ -217,32 +229,41 @@ async def chat(request: Request):
         raise HTTPException(status_code=429, detail="Too many requests")
 
     form = await request.form()
-    msg = form.get("msg", "").strip()
+    msg  = form.get("msg","").strip()
     if not msg:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    if msg in cache:
-        docs, history = cache[msg]
-    else:
-        hist = memory.load_memory_variables({})["chat_history"]
-        history = [{"role": "user" if m.type == "human" else "assistant", "content": m.content} for m in hist]
-        state = {
-            "query": msg,
-            "index_name": INDEX_NAME,
-            "namespace": "",
-            "chat_history": history,
-            "docs": [],
-            "response": ""
-        }
-        out = compiled.invoke(state)
-        answer = out["response"]
-        docs = state["docs"]
-        cache[msg] = (docs, history)
-        memory.save_context({"input": msg}, {"output": answer})
+    # offload entire pipeline to threadpool
+    hist   = memory.load_memory_variables({})["chat_history"]
+    history= [{"role":"user" if m.type=="human" else "assistant","content":m.content} for m in hist]
+    state  = {"query":msg, "index_name":INDEX_NAME, "namespace":"", "chat_history":history, "docs":[], "response":""}
+    out    = await run_in_threadpool(compiled.invoke, state)
+    answer = out["response"]
 
-    # Return plain text response
+    memory.save_context({"input":msg}, {"output":answer})
     return JSONResponse(content=answer)
 
-if __name__ == "__main__":
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_json()
+            msg  = data.get("msg","").strip()
+            if not msg:
+                await ws.send_json({"error":"Empty message"})
+                continue
+
+            hist   = memory.load_memory_variables({})["chat_history"]
+            history= [{"role":"user" if m.type=="human" else "assistant","content":m.content} for m in hist]
+            state  = {"query":msg,"index_name":INDEX_NAME,"namespace":"","chat_history":history,"docs":[],"response":""}
+            out    = await run_in_threadpool(compiled.invoke, state)
+            ans    = out["response"]
+            memory.save_context({"input":msg},{"output":ans})
+            await ws.send_json({"response":ans})
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+
+if __name__=="__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
