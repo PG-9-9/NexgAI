@@ -7,7 +7,7 @@ netstat -aon | findstr :8080
 taskkill /PID <pid> /F
 
 Running store_index:
-python store_index.py --data_percent 0.1  
+python store_index.py --data_percent 0.01  
 
 Question:
 Does Cirrhosis of liver occurs with primary peritonitis
