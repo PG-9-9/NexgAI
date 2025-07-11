@@ -11,3 +11,6 @@ python store_index.py --data_percent 0.1
 
 Question:
 Does Cirrhosis of liver occurs with primary peritonitis
+
+
+uvicorn app:app --reload

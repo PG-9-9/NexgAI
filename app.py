@@ -1,5 +1,3 @@
-# app.py
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -7,61 +5,65 @@ import os
 import logging
 import torch
 
-from flask import Flask, render_template, request
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.cors import CORSMiddleware
+
 from pinecone import Pinecone
-from pinecone.exceptions import PineconeException
 from langgraph.graph import StateGraph
 from langchain_huggingface import HuggingFaceEmbeddings
 from openai import OpenAI
 from cohere import Client as CohereClient
 from langchain.memory import ConversationSummaryBufferMemory
-from langchain.chat_models import ChatOpenAI
+from langchain_openai.chat_models import ChatOpenAI
 
 from src.prompt import system_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# load API keys
+# Load and validate keys
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-COHERE_API_KEY   = os.getenv("COHERE_API_KEY")
-if not (PINECONE_API_KEY and OPENAI_API_KEY and COHERE_API_KEY):
-    raise RuntimeError("Set PINECONE_API_KEY, OPENAI_API_KEY, COHERE_API_KEY in .env")
+COHERE_API_KEY   = os.getenv("COHERE_API_KEY", "")
 
-# init OpenAI client (v1.0+)
+if not (PINECONE_API_KEY and OPENAI_API_KEY):
+    raise RuntimeError("Set PINECONE_API_KEY & OPENAI_API_KEY in .env")
+
+if not COHERE_API_KEY:
+    logger.warning("COHERE_API_KEY not set; rerank disabled")
+    co = None
+else:
+    co = CohereClient(api_key=COHERE_API_KEY)
+
+# Init clients
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# detect device for embeddings
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Embedding device: {device}")
-
-# init Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY, environment=os.getenv("PINECONE_ENVIRONMENT","us-east1-gcp"))
+pc     = Pinecone(api_key=PINECONE_API_KEY,
+                  environment=os.getenv("PINECONE_ENVIRONMENT","us-east1-gcp"))
 INDEX_NAME = "medicalbot"
 if INDEX_NAME not in pc.list_indexes().names():
-    raise RuntimeError(f"Index '{INDEX_NAME}' not found; run store_index.py first")
+    raise RuntimeError(f"Index '{INDEX_NAME}' not found – run store_index.py first")
 
-# summary‐buffer memory for long chats
+# Memory & embeddings
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+
 memory = ConversationSummaryBufferMemory(
     llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
     memory_key="chat_history",
     return_messages=True,
     max_token_limit=3000
 )
-
-# shared BGE-large embedder
 embedder = HuggingFaceEmbeddings(
     model_name="BAAI/bge-large-en-v1.5",
-    model_kwargs={"device":device},
-    encode_kwargs={"normalize_embeddings":True},
+    model_kwargs={"device": device},
+    encode_kwargs={"normalize_embeddings": True},
 )
 
-# Cohere reranker
-co = CohereClient(api_key=COHERE_API_KEY)
-
+# LangGraph state definition
 from typing import TypedDict, List, Dict, Any
-
 class ChatState(TypedDict):
     query: str
     index_name: str
@@ -70,55 +72,49 @@ class ChatState(TypedDict):
     docs: List[Dict[str,Any]]
     response: str
 
-# dense retrieval node
-def retrieve_dense(state: ChatState) -> dict:
+# LangGraph nodes
+def retrieve(state: ChatState) -> dict:
     vec = embedder.embed_query(state["query"])
     idx = pc.Index(state["index_name"])
     resp = idx.query(vector=vec, top_k=5, include_metadata=True, namespace=state["namespace"])
-    return {"docs":[{"id":m["id"],"text":m["metadata"]["text"]} for m in resp["matches"]]}
+    return {"docs":[{"id":m["id"],"text":m["metadata"]["text"],"score":m["score"]} for m in resp["matches"]]}
 
-# HyDE fallback if no dense hits
-def hyde_fallback(state: ChatState) -> dict:
-    if state["docs"]:
+def hyde(state: ChatState) -> dict:
+    docs = state["docs"]
+    if docs and docs[0]["score"] >= 0.65:
         return {}
     prompt = f"Draft a plausible answer to: {state['query']}"
     hypo = client.chat.completions.create(
-        model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}]
+        model="gpt-3.5-turbo",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.0
     )
     text = hypo.choices[0].message.content
     vec = embedder.embed_query(text)
     idx = pc.Index(state["index_name"])
     resp = idx.query(vector=vec, top_k=5, include_metadata=True, namespace=state["namespace"])
-    return {"docs":[{"id":m["id"],"text":m["metadata"]["text"]} for m in resp["matches"]]}
+    return {"docs":[{"id":m["id"],"text":m["metadata"]["text"],"score":m["score"]} for m in resp["matches"]]}
 
-# **Fixed rerank node**  
 def rerank(state: ChatState) -> dict:
     docs = state["docs"]
-    if not docs:
-        return {"docs": []}
-
+    if not docs or co is None:
+        return {"docs": docs}
     texts = [d["text"] for d in docs]
-    resp = co.rerank(query=state["query"], documents=texts, top_n=3, model="rerank-english-v3.0")
-
-    reranked = []
-    # Cohere Python SDK v5+: resp.results is a list of RerankResult(index, relevance_score, document)
-    if hasattr(resp, "results"):
-        for result in resp.results:
-            idx = result.index
-            reranked.append(docs[idx])
+    rr = co.rerank(query=state["query"], documents=texts, top_n=3, model="rerank-english-v3.0")
+    ranked = []
+    if hasattr(rr, "results"):
+        for r in rr.results:
+            ranked.append(docs[r.index])
     else:
-        # older/coarser API returns list of document strings
-        text_to_doc = {d["text"]: d for d in docs}
-        for doc_text in resp:
-            if doc_text in text_to_doc:
-                reranked.append(text_to_doc[doc_text])
-                if len(reranked) >= 3:
+        mp = {d["text"]: d for d in docs}
+        for t in rr:
+            if t in mp:
+                ranked.append(mp[t])
+                if len(ranked) >= 3:
                     break
+    return {"docs": ranked}
 
-    return {"docs": reranked}
-
-# final answer generation
-def refine_response(state: ChatState) -> dict:
+def refine(state: ChatState) -> dict:
     messages = [{"role":"system","content":system_prompt}]
     for m in state["chat_history"]:
         role = "user" if m["role"]=="human" else "assistant"
@@ -131,57 +127,59 @@ def refine_response(state: ChatState) -> dict:
     resp = client.chat.completions.create(
         model="gpt-3.5-turbo", messages=messages, temperature=0.4, max_tokens=500
     )
-    return {"response":resp.choices[0].message.content.strip()}
+    return {"response": resp.choices[0].message.content.strip()}
 
-# assemble LangGraph
+# Assemble LangGraph
 graph = StateGraph(ChatState)
-graph.add_node("retrieve", retrieve_dense)
-graph.add_node("hyde", hyde_fallback)
+graph.add_node("retrieve", retrieve)
+graph.add_node("hyde", hyde)
 graph.add_node("rerank", rerank)
-graph.add_node("refine", refine_response)
-
+graph.add_node("refine", refine)
 graph.add_conditional_edges(
     "retrieve",
-    lambda s: "hyde" if not s["docs"] else "rerank",
+    lambda s: "hyde" if not s["docs"] or s["docs"][0]["score"] < 0.65 else "rerank",
     {"hyde":"hyde","rerank":"rerank"}
 )
 graph.add_edge("hyde","rerank")
 graph.add_edge("rerank","refine")
 graph.set_entry_point("retrieve")
 graph.set_finish_point("refine")
-
 compiled = graph.compile()
 
-# Flask app
-app = Flask(__name__)
+# FastAPI app + static files + templates
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
-@app.route("/")
-def home():
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
     memory.clear()
-    return render_template("chat.html")
+    return templates.TemplateResponse("chat.html", {"request": request})
 
-@app.route("/get", methods=["POST"])
-def chat():
-    user = request.form["msg"]
-    logger.info("User: %s", user)
+@app.post("/get")
+async def chat(request: Request):
+    form = await request.form()
+    user_msg = form.get("msg","").strip()
+    if not user_msg:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty message")
 
     hist = memory.load_memory_variables({})["chat_history"]
-    history = [{"role":m.type=="human" and "human" or "assistant","content":m.content} for m in hist]
+    history = [{"role": m.type=="human" and "human" or "assistant", "content": m.content} for m in hist]
 
-    state:ChatState = {
-        "query": user,
+    state: ChatState = {
+        "query": user_msg,
         "index_name": INDEX_NAME,
         "namespace": "",
         "chat_history": history,
         "docs": [],
         "response": ""
     }
-    result = compiled.invoke(state)
-    answer = result["response"]
-    logger.info("Bot: %s", answer)
-
-    memory.save_context({"input":user},{"output":answer})
-    return answer
+    out = compiled.invoke(state)
+    ans = out["response"]
+    memory.save_context({"input":user_msg}, {"output":ans})
+    return JSONResponse(content=ans)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
