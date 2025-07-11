@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Metrics Dashboard</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <style>
+    body {
+      background-color: #1a202c;
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+    }
+    .metric-card {
+      background-color: #2d3748;
+      border-radius: 8px;
+      padding: 1.5rem;
+      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      transition: transform 0.2s;
+    }
+    .metric-card:hover {
+      transform: translateY(-4px);
+    }
+    .chart-container {
+      position: relative;
+      height: 200px;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .btn-primary {
+      background-color: #58cc71; /* Matches chat.html link color */
+      color: white;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      text-decoration: none;
+      transition: background-color 0.2s;
+    }
+    .btn-primary:hover {
+      background-color: #38a169; /* Darker shade for hover, matches chat.html theme */
+    }
+    .na-text {
+      color: #a0aec0;
+      font-style: italic;
+    }
+    .error-text {
+      color: #f56565;
+      font-style: italic;
+      text-align: center;
+    }
+  </style>
+</head>
+<body class="p-6">
+  <div class="container mx-auto">
+    <div class="flex justify-between items-center mb-8">
+      <h1 class="text-3xl font-bold text-green-400">Prometheus Metrics Dashboard</h1>
+      <a href="/" class="btn-primary">Back to Chat</a>
+    </div>
+
+    <!-- Python GC Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">GC Objects Collected</h2>
+        <div class="chart-container">
+          <p class="error-text">Not available</p>
+        </div>
+      </div>
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">GC Collections</h2>
+        <div class="chart-container">
+          <p class="error-text">Not available</p>
+        </div>
+      </div>
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Uncollectable Objects</h2>
+        <p class="text-lg">Generation 0: <span class="text-green-400">{{ uncollectable_objects.0|default('0.0') }}</span></p>
+        <p class="text-lg">Generation 1: <span class="text-green-400">{{ uncollectable_objects.1|default('0.0') }}</span></p>
+        <p class="text-lg">Generation 2: <span class="text-green-400">{{ uncollectable_objects.2|default('0.0') }}</span></p>
+      </div>
+    </div>
+
+    <!-- Request Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Request Latency (Seconds)</h2>
+        <div class="chart-container">
+          <p class="error-text">Not available</p>
+        </div>
+      </div>
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Total Requests</h2>
+        <p class="text-2xl text-green-400">{{ requests_total|default('N/A') }}</p>
+        <p class="text-sm text-gray-400">Created: <span class="{% if requests_created != 'N/A' %}text-green-400{% else %}na-text{% endif %}">{{ requests_created|default('N/A') }}</span></p>
+        <p class="text-sm text-gray-400">Latency Created: <span class="{% if request_latency_seconds_created != 'N/A' %}text-green-400{% else %}na-text{% endif %}">{{ request_latency_seconds_created|default('N/A') }}</span></p>
+      </div>
+    </div>
+
+    <!-- Branch Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Branches Taken</h2>
+        <div class="chart-container">
+          <p class="error-text">Not available</p>
+        </div>
+      </div>
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Branch Created Timestamps</h2>
+        <p class="text-lg">Retrieve: <span class="{% if branch_created_retrieve != 'N/A' %}text-green-400{% else %}na-text{% endif %}">{{ branch_created_retrieve|default('N/A') }}</span></p>
+        <p class="text-lg">Rerank: <span class="{% if branch_created_rerank != 'N/A' %}text-green-400{% else %}na-text{% endif %}">{{ branch_created_rerank|default('N/A') }}</span></p>
+        <p class="text-lg">Refine: <span class="{% if branch_created_refine != 'N/A' %}text-green-400{% else %}na-text{% endif %}">{{ branch_created_refine|default('N/A') }}</span></p>
+      </div>
+      <div class="metric-card">
+        <h2 class="text-xl font-semibold mb-4">Python Info</h2>
+        <p class="text-lg">Version: <span class="text-green-400">3.10.18</span></p>
+        <p class="text-lg">Implementation: <span class="text-green-400">CPython</span></p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Grafana Dashboard Spec</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body class="p-4 text-white bg-dark">
+  <div class="container">
+    <h1>Dashboard JSON</h1>
+    <pre style="white-space: pre-wrap; background: rgba(0,0,0,0.5); padding:1rem; border-radius:8px;">
+{{ dashboard | tojson(indent=2) }}
+    </pre>
+    <a href="/" class="btn btn-primary mt-3">Back to Chat</a>
+  </div>
+</body>
+</html>
