@@ -1,3 +1,5 @@
+# store_index.py
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -13,220 +15,162 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import argparse
 import re
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Verify PyTorch version
-required_torch_version = "2.6.0"
-if torch.__version__ < required_torch_version:
-    raise RuntimeError(f"PyTorch version {torch.__version__} is too old. Please upgrade to {required_torch_version} or higher.")
+# require PyTorch ≥2.6.0
+if torch.__version__ < "2.6.0":
+    raise RuntimeError(f"PyTorch {torch.__version__} too old; upgrade to ≥2.6.0")
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Index MedMCQA dataset into Pinecone.")
-parser.add_argument(
-    "--data_percent",
-    type=float,
-    default=0.1,
-    help="Percentage of dataset to process (0.0 to 1.0)",
-)
+# CLI: % of dataset to index
+parser = argparse.ArgumentParser("Index MedMCQA into Pinecone")
+parser.add_argument("--data_percent", type=float, default=0.1,
+                    help="Portion of dataset (0.0–1.0) to process")
 args = parser.parse_args()
-data_percent = max(0.0, min(1.0, args.data_percent))  # Clamp between 0 and 1
-logger.info(f"Using {data_percent*100}% of the dataset.")
+data_percent = max(0.0, min(1.0, args.data_percent))
+logger.info(f"Indexing {data_percent*100:.1f}% of MedMCQA")
 
-# Check for GPU availability
+# choose GPU if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using device: {device}")
 if device == "cpu":
-    logger.warning("GPU not available, falling back to CPU. This will be slower.")
+    logger.warning("No GPU detected; embedding will be slower")
 
-# Load and validate Pinecone credentials
+# init Pinecone
 api_key = os.getenv("PINECONE_API_KEY")
 if not api_key:
-    raise RuntimeError("PINECONE_API_KEY not found in .env")
-
-# Initialize Pinecone client and index
-pc = Pinecone(api_key=api_key)
+    raise RuntimeError("Missing PINECONE_API_KEY in .env")
+pc = Pinecone(api_key=api_key, environment=os.getenv("PINECONE_ENVIRONMENT","us-east1-gcp"))
 index_name = "medicalbot"
 
-existing = pc.list_indexes().names()
-if index_name not in existing:
-    logger.info(f"Creating index '{index_name}'...")
-    pc.create_index(
-        name=index_name,
-        dimension=768,  # For bionlp/bluebert_pubmed_uncased_L-12_H-768_A-12
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-    )
+# create or clear index (now dim=1024 for BGE-large)
+if index_name not in pc.list_indexes().names():
+    logger.info(f"Creating Pinecone index '{index_name}' (dim=1024)")
+    pc.create_index(name=index_name, dimension=1024, metric="cosine",
+                    spec=ServerlessSpec(cloud="aws", region="us-east-1"))
 else:
-    logger.info(f"Clearing existing index '{index_name}'...")
+    logger.info(f"Clearing existing index '{index_name}'")
     idx = pc.Index(index_name)
     try:
         idx.delete(delete_all=True, namespace="")
     except NotFoundException:
-        logger.info("Index was already empty.")
+        logger.info("Index was already empty")
 
-# Load the MedMCQA dataset
-logger.info("Loading MedMCQA dataset (train split)...")
-try:
-    dataset = load_dataset("openlifescienceai/medmcqa", split="train")
-    total = len(dataset)
-    logger.info(f"Loaded {total} examples.")
-    if data_percent < 1.0:
-        dataset = dataset.select(range(int(total * data_percent)))
-        logger.info(f"Selected {len(dataset)} examples ({data_percent*100}%).")
-except Exception as e:
-    logger.error(f"Failed to load dataset: {e}")
-    raise
+# load MedMCQA
+logger.info("Loading MedMCQA (train split)...")
+ds = load_dataset("openlifescienceai/medmcqa", split="train")
+total = len(ds)
+logger.info(f"Total examples: {total}")
+if data_percent < 1.0:
+    cutoff = int(total * data_percent)
+    ds = ds.select(range(cutoff))
+    logger.info(f"Selected {len(ds)} examples ({data_percent*100:.1f}%)")
 
-# Prepare text chunks and metadata
-ids = []
-texts = []
-metadatas = []
-option_map = {0: "A", 1: "B", 2: "C", 3: "D"}  # Zero-based mapping
-option_map_reverse = {"a": 0, "b": 1, "c": 2, "d": 3}  # For parsing explanation
-valid_cops = set(option_map.keys())
+# prepare chunks & metadata
+ids, texts, metadatas = [], [], []
+option_map = {0:"A",1:"B",2:"C",3:"D"}
+option_map_rev = {"a":0,"b":1,"c":2,"d":3}
+valid = set(option_map.values())
 
-for item in dataset:
+for item in ds:
     qid = str(item["id"])
-    question = item["question"] or "Unknown"
+    question = item.get("question") or "Unknown"
     opts = {
-        "A": item["opa"] or "Unknown",
-        "B": item["opb"] or "Unknown",
-        "C": item["opc"] or "Unknown",
-        "D": item["opd"] or "Unknown",
+        "A": item.get("opa") or "Unknown",
+        "B": item.get("opb") or "Unknown",
+        "C": item.get("opc") or "Unknown",
+        "D": item.get("opd") or "Unknown",
     }
-    explanation = item["exp"] if item["exp"] else "No explanation provided."
-    choice_type = item["choice_type"] if item["choice_type"] is not None else "single"
+    explanation = item.get("exp") or "No explanation provided."
+    choice_type = item.get("choice_type") or "single"
 
-    # Parse numbered sub-options from question (e.g., "1. Venous ulcer 2. Pulmonary embolism")
-    sub_options = {}
-    sub_option_matches = re.findall(r"(\d+)\.\s*(.*?)(?=\n\d+\.|$)", question, re.S)
-    for num, text in sub_option_matches:
-        sub_options[str(int(num))] = text.strip()
+    # parse numbered sub-options in question
+    sub_options = {n: txt.strip() for n,txt in
+        re.findall(r"(\d+)\.\s*(.*?)(?=\n\d+\.|$)", question, re.S)
+    }
 
-    # Parse explanation for correct option(s)
-    correct_options_from_exp = []
-    if explanation != "No explanation provided.":
-        matches = re.findall(r"Ans\. is\s*['\"]([a-d](?:\s*,\s*[a-d])*)['\"]", explanation, re.IGNORECASE)
-        if matches:
-            options = matches[0].replace(" ", "").split(",")
-            correct_options_from_exp = [option_map_reverse.get(opt.lower()) for opt in options if opt.lower() in option_map_reverse]
+    # try extract correct from explanation
+    corr_exp = []
+    match = re.search(r"Ans\. is\s*['\"]([A-D](?:\s*,\s*[A-D])*)['\"]", explanation, re.I)
+    if match:
+        corr_exp = [option_map_rev[c.lower()] for c in match.group(1).split(",")]
 
-    # Handle cop
-    cop = item["cop"] if item["cop"] is not None else 0
-    if isinstance(cop, (int, float)):
+    # handle cop field fallback
+    cop = item.get("cop",0)
+    if isinstance(cop,(int,float)):
         cop = int(cop)
-    elif isinstance(cop, list):
-        cop = [int(c) for c in cop]
+    elif isinstance(cop,list):
+        cop = [int(x) for x in cop]
     else:
         cop = 0
-        logger.warning(f"Invalid cop type {type(item['cop'])} for ID {qid}. Defaulting to 0.")
 
-    # Determine correct options
-    if correct_options_from_exp and all(c in valid_cops for c in correct_options_from_exp):
-        correct_options = correct_options_from_exp
+    # determine correct options
+    if corr_exp and all(c in range(4) for c in corr_exp):
+        correct = corr_exp
     else:
-        if choice_type == "multi" and isinstance(cop, list):
-            correct_options = [c for c in cop if c in valid_cops]
+        if choice_type=="multi" and isinstance(cop,list):
+            correct = [c for c in cop if c in range(4)]
         else:
-            correct_options = [cop] if cop in valid_cops else [0]
+            correct = [cop] if cop in range(4) else [0]
 
-    # Handle "All are true" or multi-choice with sub-options
-    if choice_type == "multi" and (opts["D"].lower() == "all are true" or len(correct_options) > 1):
+    # expand “all of the above” or sub-options
+    if choice_type=="multi" and (opts["D"].lower().startswith("all") or len(correct)>1):
         if sub_options:
-            correct_options = [int(k) - 1 for k in sub_options.keys()]  # Map to all sub-options
-            correct_answers = list(sub_options.values())
+            correct = [int(k)-1 for k in sub_options]
+            answers = list(sub_options.values())
         else:
-            # Parse sub-options from options (e.g., "1,2,3 & 4")
-            sub_option_nums = []
-            for opt in correct_options:
-                if opts[option_map[opt]].lower() != "all are true":
-                    nums = re.findall(r"\d+", opts[option_map[opt]])
-                    sub_option_nums.extend([int(n) - 1 for n in nums if n in sub_options])
-            correct_options = list(set(sub_option_nums)) if sub_option_nums else correct_options
-            correct_answers = [sub_options[str(c + 1)] for c in correct_options if str(c + 1) in sub_options]
+            answers = [opts[option_map[c]] for c in correct]
     else:
-        correct_answers = [opts[option_map[c]] for c in correct_options]
+        answers = [opts[option_map[c]] for c in correct]
 
-    # Log discrepancies or invalid cop
-    if isinstance(cop, (int, float)) and cop not in valid_cops:
-        logger.warning(f"Invalid cop={cop} for ID {qid}. Using {correct_options} from explanation or default.")
-    elif isinstance(cop, list) and any(c not in valid_cops for c in cop):
-        logger.warning(f"Invalid cop values in {cop} for ID {qid}. Using {correct_options} from explanation or default.")
-    elif correct_options_from_exp and set(correct_options_from_exp) != set(correct_options):
-        logger.warning(f"Discrepancy for ID {qid}: cop={cop} ({[option_map[c] for c in ([cop] if isinstance(cop, int) else cop)]}), explanation indicates {correct_options_from_exp} ({[option_map[c] for c in correct_options_from_exp]})")
-
-    correct_answer_text = ", ".join(correct_answers) if correct_answers else "Unknown"
-
-    # Create text chunk with sub-options for multi-choice or "All are true"
-    text = [f"Question: {question}"]
-    if sub_options and (choice_type == "multi" or opts["D"].lower() == "all are true"):
-        text.append(f"Correct Answer{'s' if len(correct_answers) > 1 else ''}: {correct_answer_text}")
-    else:
-        text.append(f"Correct Answer{'s' if len(correct_answers) > 1 else ''}: {correct_answer_text}")
-    text.append(f"Explanation: {explanation}")
+    # build text block
+    block = [f"Question: {question}"]
+    for L,O in opts.items():
+        block.append(f"{L}: {O}")
+    block.append(f"Correct: {', '.join(answers) or 'Unknown'}")
+    block.append(f"Explanation: {explanation}")
+    text = "\n".join(block)
 
     ids.append(qid)
-    texts.append("\n".join(text))
-    metadata = {
-        "text": "\n".join(text),
-        "correct_options": [str(c) for c in correct_options],
-        "correct_answer_text": correct_answer_text,
-        "option_a": opts["A"],
-        "option_b": opts["B"],
-        "option_c": opts["C"],
-        "option_d": opts["D"],
-        "subject_name": item["subject_name"] if item["subject_name"] is not None else "Unknown",
-        "topic_name": item["topic_name"] if item["topic_name"] is not None else "Unknown",
-        "choice_type": choice_type
+    texts.append(text)
+    md = {
+        "text": text,
+        "correct_options":[str(c) for c in correct],
+        "correct_answer_text": ", ".join(answers),
+        "subject": item.get("subject_name") or "Unknown",
+        "topic": item.get("topic_name") or "Unknown",
+        "choice_type": choice_type,
     }
-    # Add sub-options to metadata
-    for i, (num, text) in enumerate(sub_options.items()):
-        metadata[f"sub_option_{i+1}"] = text
-    metadatas.append(metadata)
+    for i,(n,so) in enumerate(sub_options.items(),1):
+        md[f"sub_option_{i}"] = so
+    metadatas.append(md)
 
-logger.info(f"Prepared {len(texts)} text chunks for embedding.")
+logger.info(f"Prepared {len(texts)} chunks")
 
-# Initialize embedder
-try:
-    embedder = HuggingFaceEmbeddings(
-        model_name="bionlp/bluebert_pubmed_uncased_L-12_H-768_A-12",
-        model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True}
-    )
-except Exception as e:
-    logger.error(f"Failed to initialize embedder: {e}")
-    raise
+# init BGE-large embedder
+embedder = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-large-en-v1.5",
+    model_kwargs={"device":device},
+    encode_kwargs={"normalize_embeddings":True},
+)
 
-batch_size = 32  # For 768-dim model and 8GB VRAM
+batch_size = 64  
 vectors = []
+logger.info("Embedding in batches with mixed precision...")
+for i in tqdm(range(0, len(texts), batch_size), desc="Embed"):
+    batch = texts[i:i+batch_size]
+    with autocast(device):
+        vecs = embedder.embed_documents(batch)
+    vectors.extend(vecs)
+logger.info(f"Generated {len(vectors)} vectors")
 
-logger.info("Generating embeddings in batches with mixed precision...")
-for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
-    batch_texts = texts[i : i + batch_size]
-    try:
-        with autocast('cuda'):
-            batch_vecs = embedder.embed_documents(batch_texts)
-        vectors.extend(batch_vecs)
-    except Exception as e:
-        logger.error(f"Error embedding batch {i // batch_size}: {e}")
-        continue
-logger.info(f"Embedding complete. Generated {len(vectors)} embeddings.")
-
-# Upsert in batches
+# upsert in batches
 index = pc.Index(index_name)
-logger.info("Upserting vectors to Pinecone in batches...")
-for i in tqdm(range(0, len(vectors), batch_size), desc="Upserting"):
-    to_up = [
+logger.info("Upserting vectors to Pinecone...")
+for i in tqdm(range(0, len(vectors), batch_size), desc="Upsert"):
+    chunk = [
         (ids[j], vectors[j], metadatas[j])
-        for j in range(i, min(i + batch_size, len(vectors)))
+        for j in range(i, min(i+batch_size, len(vectors)))
     ]
-    try:
-        index.upsert(vectors=to_up, namespace="")
-    except Exception as e:
-        logger.error(f"Error upserting batch {i // batch_size}: {e}")
-        continue
-logger.info(f"Upsert complete. Indexed {len(vectors)} vectors.")
+    index.upsert(vectors=chunk, namespace="")
+logger.info("Indexing complete.")
