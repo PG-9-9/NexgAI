@@ -178,7 +178,7 @@ pip install -r requirements.txt
    * Chat UI: [http://localhost:8080/](http://localhost:8080/)
    * Health UI: [http://localhost:8080/health-ui](http://localhost:8080/health-ui)
    * Metrics UI: [http://localhost:8080/metrics-ui](http://localhost:8080/metrics-ui)
-   * Dashboard: [http://localhost:8080/dashboard](http://localhost:8080/dashboard)
+   <!-- * Dashboard: [http://localhost:8080/dashboard](http://localhost:8080/dashboard) -->
 
 ### Docker Build & Run
 
