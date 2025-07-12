@@ -2,6 +2,8 @@
 
 Below is my submission for NexGAI challenge. Currently titled (MedBot) is a RAG system tailored to answer multiple-choice medical questions using **only** the MedMCQA dataset. By indexing every question, option, and explanation, MedBot guarantees that its responses remain grounded in verified medical knowledge without resorting to general web data or hallucinations.( I hope I covered most important topics in challenge :) ).
 
+PS: To run the app manually or with Docker, you need to set up the environment keys—use a .env file (stored in root folder) for local runs or API keys if you’re running through Docker. If that sounds confusing, just follow the README :)
+
 ---
 
 ## Table of Contents
@@ -152,17 +154,26 @@ pip install -r requirements.txt
 
 ### Manual Run (Local)
 
-1. **Index** the dataset:
+1. **Create Conda Environment** *(recommended)*:
+
+   ```bash
+   conda env create -f environment.yml
+   conda activate medbot
+   ```
+
+2. **Index** the dataset:
 
    ```bash
    python store_index.py --data_percent 1.0
    ```
-2. **Start** the server:
+
+3. **Start** the server:
 
    ```bash
    uvicorn app:app --reload --host 0.0.0.0 --port 8080
    ```
-3. **Browse**:
+
+4. **Browse**:
 
    * Chat UI: [http://localhost:8080/](http://localhost:8080/)
    * Health UI: [http://localhost:8080/health-ui](http://localhost:8080/health-ui)
@@ -176,11 +187,13 @@ pip install -r requirements.txt
    ```bash
    pip freeze > requirements.txt
    ```
+
 2. **Build**:
 
    ```bash
    docker build -t medbot:latest .
    ```
+
 3. **Run** (replace keys):
 
    ```bash
@@ -190,7 +203,23 @@ pip install -r requirements.txt
      -e COHERE_API_KEY="…" \
      medbot:latest
    ```
+
 4. **Access** the same URLs as above (port 8080).
+
+5. **(⭐ DockerHub Pull – coming soon)**
+
+   *(The image is currently being uploaded and should be available around **4 PM DE time**. Due to limited bandwidth, upload is slow. Also, the Dockerfile is not yet optimized — expect a larger image size for now.)*
+
+   Once ready, you can pull and run MedBot directly via:
+
+   ```bash
+   docker pull vishaals0507/medbot:latest
+   docker run -d -p 8080:8080 \
+     -e PINECONE_API_KEY="…" \
+     -e OPENAI_API_KEY="…" \
+     -e COHERE_API_KEY="…" \
+     vishaals0507/medbot:latest
+   ```
 
 ---
 
@@ -219,6 +248,7 @@ python store_index.py --data_percent 0.1
 * Loads 10% of MedMCQA for quick feedback.
 * Processes text, handles sub-options, explanation parsing.
 * Generates mixed-precision embeddings in batches and upserts them to Pinecone.
+* Due to time constraints and limited compute resources, the current embeddings was generated using only 10% of the data (during the Medbot build)
 
 ---
 

@@ -16,4 +16,3 @@ Does Cirrhosis of liver occurs with primary peritonitis
 uvicorn app:app --reload
 
 Docker run :
-docker run -d -p 8080:8080 -e PINECONE_API_KEY="..." -e OPENAI_API_KEY="..." -e COHERE_API_KEY="..." medbot:latest
