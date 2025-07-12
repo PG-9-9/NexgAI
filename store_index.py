@@ -18,7 +18,6 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# CLI first
 parser = argparse.ArgumentParser("Index MedMCQA into Pinecone")
 parser.add_argument("--data_percent", type=float, default=float(os.getenv("DATA_PERCENT","0.1")),
                     help="Fraction of dataset to index (0.0–1.0)")
@@ -33,6 +32,7 @@ EMBED_MODEL  = os.getenv("EMBEDDING_MODEL","BAAI/bge-large-en-v1.5")
 
 logger.info(f"Indexing {data_percent*100:.2f}% of the dataset (batch_size={BATCH_SIZE})")
 
+# Check PyTorch version, since we use autocast
 if torch.__version__ < "2.6.0":
     raise RuntimeError("PyTorch ≥2.6.0 required")
 
@@ -114,7 +114,7 @@ for item in tqdm(ds, desc="Chunking"):
         else:
             correct = [cop] if 0 <= cop < 4 else [0]
 
-    # handle "all of the above" or sub-options
+    # handle "all of the above" and also the sub-options
     if ctype=="multi" and (
         opts["D"].lower().startswith("all") or len(correct)>1
     ):
@@ -126,7 +126,7 @@ for item in tqdm(ds, desc="Chunking"):
     else:
         answers = [opts[opt_map[c]] for c in correct]
 
-    # assemble text
+    # Chunking text
     block = [f"Question: {q}"] + [f"{L}: {O}" for L,O in opts.items()]
     block += [
         f"Correct: {', '.join(answers) or 'Unknown'}",
@@ -150,14 +150,15 @@ for item in tqdm(ds, desc="Chunking"):
 
 logger.info(f"Prepared {len(texts)} text chunks")
 
-# Initialize embedder
+#  Embedder setup
+#TODO: Probably check medbase embedding model here(BioBERT, ClinicalBert), and also OpenAI embedding model (would potentially reduce the size of docker image)
 embedder = HuggingFaceEmbeddings(
     model_name=EMBED_MODEL,
     model_kwargs={"device":device},
     encode_kwargs={"normalize_embeddings":True},
 )
 
-# Generate embeddings
+# Create embeddings
 vectors = []
 logger.info("Generating embeddings…")
 for i in tqdm(range(0,len(texts),BATCH_SIZE), desc="Embedding"):

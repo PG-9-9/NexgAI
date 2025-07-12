@@ -87,7 +87,7 @@ def pinecone_query(vec, top_k):
 def cohere_rerank(query, docs):
     return co.rerank(query=query, documents=docs, top_n=3, model="rerank-english-v3.0")
 
-# Dashboard spec (importable in Grafana)
+# Dashboard spec for Grafana
 grafana_dashboard = {
   "title":"MedBot Metrics",
   "panels":[
@@ -174,7 +174,7 @@ graph.set_entry_point("retrieve")
 graph.set_finish_point("refine")
 compiled=graph.compile()
 
-# Custom Jinja2 filter for datetime formatting
+# Datetime formatting for Jinja2 filter
 def datetime_format(value, format='%B %d, %Y, %I:%M %p %Z'):
     if value is None or not isinstance(value, (int, float)):
         return 'N/A'
@@ -186,7 +186,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# Register the custom filter
+# Registering the custom filter
 templates.env.filters['datetime_format'] = datetime_format
 
 @app.get("/metrics")
@@ -197,6 +197,7 @@ def metrics():                  # Prometheus scraper
 def health():                   # raw JSON
     return JSONResponse({"status":"ok","time":time.time()})
 
+#TODO: Add a route to serve the Grafana dashboard JSON, (Not implemented for now)
 @app.get("/dashboard.json")
 def dashboard_json():           # raw JSON
     return JSONResponse(grafana_dashboard)
@@ -206,7 +207,7 @@ def home(request: Request):
     memory.clear()
     return templates.TemplateResponse("chat.html", {"request":request})
 
-# -- New UI routes --
+# -- Other UI routes --
 
 @app.get("/health-ui", response_class=HTMLResponse)
 def health_ui(request: Request):
