@@ -3,6 +3,7 @@ Activate env:
 conda activate env\nex
 
 Kill the port in Powershell(admin), if its already in use
+
 netstat -aon | findstr :8080
 taskkill /PID <pid> /F
 

@@ -208,7 +208,7 @@ pip install -r requirements.txt
 
 5. **(⭐ DockerHub Pull – coming soon)**
 
-   *(The image is currently being uploaded and should be available around **4 PM DE time**. Due to limited bandwidth, upload is slow. Also, the Dockerfile is not yet optimized — expect a larger image size for now.)*
+   *(The image is currently being uploaded and should be available around **July 12, 2025 16:00 GMT+2 time**. Due to limited bandwidth, upload is slow. Also, the Dockerfile is not yet optimized — expect a larger image size for now.)*
 
    Once ready, you can pull and run MedBot directly via:
 
