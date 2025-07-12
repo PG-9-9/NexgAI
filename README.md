@@ -261,3 +261,9 @@ python store_index.py --data_percent 0.1
 
 ---
 
+Side Note for NexGAI Team:
+
+From the shared document, I understand the team isn’t focusing on deployment modules right now, so I haven’t worked on MLOps orchestration for this. However, if the team thinks it’s important, I’d ideally need some time to take it on. That would likely expand the stack from the current Docker setup to include ECR and EC2.
+
+Also, I’ll need to optimize the current embedding model to reduce the Docker image size, in case we proceed with that system design.
+
